@@ -1,0 +1,15 @@
+
+# Map files to owners (replace @handles or names later)
+/socp/core/ws.py           @personA
+/socp/core/router.py       @personA
+/socp/core/proto.py        @personA
+/socp/core/peers.py        @personB
+/socp/core/presence.py     @personB
+/socp/core/crypto.py       @personC
+/socp/utils/canonical.py   @personC
+/socp/cmd/client.py        @personD
+/socp/core/files.py        @personD
+/socp/core/store.py        @personE
+/socp/core/public.py       @personE
+/db/*                      @personE
+/README.txt                @personE

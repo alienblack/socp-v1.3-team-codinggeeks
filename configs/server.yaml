@@ -1,0 +1,11 @@
+
+server_id: "00000000-0000-4000-8000-000000000001"
+listen: "0.0.0.0:7001"
+db_path: "socp.db"
+advertise_pubkey: ""
+bootstrap_file: "configs/bootstrap.yaml"
+heartbeat_secs: 15
+dead_after_secs: 45
+vulns:
+  weak_keys: true
+  replay_bypass: true

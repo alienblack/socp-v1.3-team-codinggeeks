@@ -1,0 +1,51 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Server A",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "socp.cmd.server",
+      "args": ["--config", "configs/server.yaml"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Server B",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "socp.cmd.server",
+      "args": ["--config", "configs/server_b.yaml"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Client → ws://127.0.0.1:7001",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "socp.cmd.client",
+      "args": ["--server", "ws://127.0.0.1:7001"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Client → ws://127.0.0.1:7002",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "socp.cmd.client",
+      "args": ["--server", "ws://127.0.0.1:7002"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Servers A+B",
+      "configurations": ["Server A", "Server B"]
+    }
+  ]
+}

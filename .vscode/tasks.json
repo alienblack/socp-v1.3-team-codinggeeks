@@ -1,0 +1,10 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "Install deps", "type": "shell", "command": "pip install -r requirements.txt" },
+    { "label": "Run tests", "type": "shell", "command": "pytest -q" },
+    { "label": "Server A", "type": "shell", "command": "python -m socp.cmd.server --config configs/server.yaml", "problemMatcher": [] },
+    { "label": "Server B", "type": "shell", "command": "python -m socp.cmd.server --config configs/server_b.yaml", "problemMatcher": [] },
+    { "label": "Client (prompt for URL)", "type": "shell", "command": "read -p 'WS URL: ' U; python -m socp.cmd.client --server $U", "problemMatcher": [] }
+  ]
+}
