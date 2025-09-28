@@ -22,13 +22,13 @@ class ProtocolError(Exception):
 ERROR_CODES = {"USER_NOT_FOUND","INVALID_SIG","BAD_KEY","TIMEOUT","UNKNOWN_TYPE","NAME_IN_USE"}
 
 def now_ms() -> int:
-    return int(time()*1000)
+    return int(time.time()*1000)
 
 def build_frame(type: str, from_: str, to: str, payload: dict) -> dict:
     return {"type": type, 
             "from": from_, 
             "to": to, 
-            "ts": int(time()*1000), 
+            "ts": int(time.time()*1000), 
             "payload": payload,
             "sig": ""}
 
