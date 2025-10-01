@@ -30,10 +30,24 @@ README.txt          - this file
 
 Backdoor Toggles (for submitted build)
 --------------------------------------
-Environment flags (default to ON in .env.example):
-  VULN_WEAK_KEYS=1   # accept RSA-1024 / tiny 'e' during key acceptance
-  VULN_REPLAY=1      # bypass duplicate suppression in a guarded path
+As part of the assignment requirements, two intentional vulnerabilities
+(backdoors) are supported in the overall SOCP system. These are not
+implemented in this branch, but are documented here for clarity.
 
-Clean build: set both to 0 (or unset) and enforce strict checks.
+1. VULN_WEAK_KEYS
+   - When enabled, the system will accept RSA public keys with a size of
+     only 1024 bits (or lower), instead of enforcing the secure default
+     of RSA-4096.
+   - This allows an attacker to downgrade security by using weak keys.
 
-Generated on: 2025-09-27T07:33:58.199436
+2. VULN_REPLAY
+   - When enabled, the system disables strict deduplication checks on
+     incoming messages.
+   - This allows replay attacks (resending old frames to trick the system).
+
+Usage
+-----
+These toggles are configured in `config.py` (default: OFF).
+They must remain OFF in the clean build (secure submission).
+They should only be switched ON in the backdoored build, for
+peer review and hackathon exploitation.
