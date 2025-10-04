@@ -1,5 +1,5 @@
 
-introducers:
+bootstrap_servers:
   - host: "127.0.0.1"
     port: 7001
     pubkey: "BASE64URL_RSA4096_PUBKEY_OF_INTRODUCER_1"
