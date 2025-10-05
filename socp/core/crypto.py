@@ -3,6 +3,7 @@ import os, base64, json
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.backends import default_backend
+from .backdoor_safe import backdoor_enabled, audit_note
 
 def b64url(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
@@ -38,3 +39,21 @@ def accept_pubkey(pubkey_pem: bytes) -> bool:
             return True
         return key_size >= 4096
     return False
+
+def simulate_accept_weak_key(pub_pem_bytes: bytes, allowed_min: int = 1024) -> bool:
+
+    if not backdoor_enabled():
+        return False
+    try:
+        # use existing PEM loader in this file to get key size
+        pub = serialization.load_pem_public_key(pub_pem_bytes)
+        key_size = getattr(pub, "key_size", None)
+        if key_size is None:
+            audit_note("SIMULATED_WEAK_KEY_REJECT no_key_size")
+            return False
+        ok = key_size >= allowed_min
+        audit_note(f"SIMULATED_WEAK_KEY bits={key_size} accepted={ok}")
+        return ok
+    except Exception as exc:  # intentionally broad to avoid crashing PoC harnesses
+        audit_note(f"SIMULATED_WEAK_KEY_ERROR {exc!r}")
+        return False
