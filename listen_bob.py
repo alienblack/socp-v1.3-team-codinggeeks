@@ -36,7 +36,7 @@ def build_env(kind: str, sender: str, target, payload: dict) -> dict:
         "type": kind,
         "from": sender,
         "to": target,
-        "ts": int(time.time()),
+        "ts": int(time.time() * 1000),
         "payload": payload,
         "sig": "",
     }
@@ -51,7 +51,19 @@ async def run(args):
         priv = serialization.load_pem_private_key(fh.read(), password=None)
 
     async with websockets.connect(args.server) as ws:
-        hello_payload = {"meta": {"display": args.display}}
+        pub_pem = (
+            priv.public_key()
+            .public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            .decode("utf-8")
+        )
+        hello_payload = {
+            "client": "listen_client",
+            "pubkey": pub_pem,
+            "meta": {"display": args.display},
+        }
         hello = sign_envelope(priv, build_env("USER_HELLO", args.user, "server", hello_payload))
         await ws.send(serialise(hello))
         print(">>", "USER_HELLO")
