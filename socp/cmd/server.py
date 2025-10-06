@@ -639,7 +639,8 @@ async def _handle_peer_disconnect(server_id: str) -> None:
 
 async def _on_disconnect(link) -> None:
     """Shared websocket disconnect hook for both users and servers."""
-    if getattr(link, "kind", None) == "user":
+    kind = getattr(link, "kind", None)
+    if kind == "user":
         user = getattr(link, "_socp_user", None)
         if user:
             links = ACTIVE.get(user)
@@ -651,11 +652,11 @@ async def _on_disconnect(link) -> None:
                     removal = await public.remove_local_member(user)
                     if removal:
                         await _broadcast_server_frame("PUBLIC_CHANNEL_UPDATED", public.snapshot())
-            elif getattr(link, "kind", None) == "server":
-                server_id = getattr(link, "peer_id", None)
-                if server_id:
-                    peers.forget(server_id)
-                    presence.handle_remote_disconnect(server_id)
+    elif kind == "server":
+        server_id = getattr(link, "peer_id", None)
+        if server_id:
+            peers.forget(server_id)
+            presence.handle_remote_disconnect(server_id)
             PEER_LAST_SEEN.pop(server_id, None)
 
 
