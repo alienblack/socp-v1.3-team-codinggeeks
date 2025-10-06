@@ -23,6 +23,7 @@ _REMOTE_MEMBERS: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
 
 def configure(server_id: str) -> None:
+    """Set the local server id so every payload lists the correct source."""
     global _LOCAL_SERVER_ID
     if server_id:
         _LOCAL_SERVER_ID = server_id
@@ -31,10 +32,12 @@ def configure(server_id: str) -> None:
 
 
 def _now_ms() -> int:
+    """Return the current time in milliseconds for timestamps."""
     return int(time.time() * 1000)
 
 
 def _db():
+    """Reuse the shared database connection for public-channel tables."""
     return store._ensure_db()
 
 
@@ -109,6 +112,7 @@ def _channel_key() -> bytes:
 
 
 async def _bump_version(db) -> None:
+    """Increase the membership version whenever we change the roster."""
     global _CHANNEL_VERSION
     _CHANNEL_VERSION += 1
     await db.execute(
@@ -171,6 +175,7 @@ async def add_local_member(user_id: str, pubkey_pem: bytes) -> Tuple[Optional[Di
 
 
 async def remove_local_member(user_id: str) -> Optional[Dict[str, Any]]:
+    """Drop a local user from the public channel and announce the change."""
     if user_id not in _LOCAL_MEMBERS:
         return None
     db = _db()
@@ -190,6 +195,7 @@ async def remove_local_member(user_id: str) -> Optional[Dict[str, Any]]:
 
 
 def snapshot() -> Dict[str, Any]:
+    """Return a serialisable picture of our known public channel members."""
     return {
         "channel": _CHANNEL_ID,
         "version": _CHANNEL_VERSION,
@@ -203,6 +209,7 @@ def snapshot() -> Dict[str, Any]:
 
 
 def handle_remote_add(payload: Dict[str, Any]) -> None:
+    """Track a remote server telling us it added a user to the channel."""
     if payload.get("channel") != _CHANNEL_ID:
         return
     server_id = payload.get("server_id")
@@ -219,6 +226,7 @@ def handle_remote_add(payload: Dict[str, Any]) -> None:
 
 
 def handle_remote_update(payload: Dict[str, Any]) -> None:
+    """Replace our view of another server's local members with a snapshot."""
     if payload.get("channel") != _CHANNEL_ID:
         return
     server_id = payload.get("server_id")
@@ -234,6 +242,7 @@ def handle_remote_update(payload: Dict[str, Any]) -> None:
 
 
 def handle_remote_key_share(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Remember the wrapped key sent to us for one of our users."""
     if payload.get("channel") != _CHANNEL_ID:
         return None
     user = payload.get("user")
@@ -250,6 +259,7 @@ def handle_remote_key_share(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 
 def handle_remote_snapshot(server_id: str, users: Dict[str, Dict[str, Any]]) -> None:
+    """Store a snapshot of who a remote server says is in the channel."""
     if not isinstance(server_id, str):
         return
     members: Dict[str, Dict[str, Any]] = {}
@@ -260,6 +270,7 @@ def handle_remote_snapshot(server_id: str, users: Dict[str, Dict[str, Any]]) -> 
 
 
 def handle_remote_leave(server_id: str, user_id: str) -> None:
+    """Forget a remote user when their host tells us they left."""
     if server_id in _REMOTE_MEMBERS:
         _REMOTE_MEMBERS[server_id].pop(user_id, None)
         if not _REMOTE_MEMBERS[server_id]:
@@ -267,6 +278,7 @@ def handle_remote_leave(server_id: str, user_id: str) -> None:
 
 
 def handle_remote_disconnect(server_id: str) -> None:
+    """Forget every user from a server that just disconnected."""
     _REMOTE_MEMBERS.pop(server_id, None)
 
 

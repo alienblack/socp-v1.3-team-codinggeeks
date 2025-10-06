@@ -54,10 +54,12 @@ USER_DIRECT_TYPES = {"MSG_DIRECT", "USER_MESSAGE"}
 
 
 def _now_ms() -> int:
+    """Return the current time in milliseconds."""
     return int(time.time() * 1000)
 
 
 def _load_key_material(value: Optional[str]) -> bytes:
+    """Load PEM key material either from inline text or a file path."""
     if not value:
         raise ValueError("key path or value not provided")
     if "BEGIN" in value:
@@ -68,6 +70,7 @@ def _load_key_material(value: Optional[str]) -> bytes:
 
 
 def _load_server_keys(cfg: Dict[str, Any]) -> None:
+    """Read the configured server key pair into module-level caches."""
     global SERVER_PRIVATE_PEM, SERVER_PUBLIC_PEM, SERVER_PUBLIC_TEXT
     priv_path = cfg.get("server_private_key")
     pub_path = cfg.get("server_public_key")
@@ -79,6 +82,7 @@ def _load_server_keys(cfg: Dict[str, Any]) -> None:
 
 
 def _error_frame(code: str, reason: str, ref: Optional[str] = None) -> Dict[str, Any]:
+    """Build an unsigned error frame so we can reply in failure scenarios."""
     return {
         "type": "ERROR",
         "from": LOCAL_SERVER_ID,
@@ -90,12 +94,14 @@ def _error_frame(code: str, reason: str, ref: Optional[str] = None) -> Dict[str,
 
 
 def _encode_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert any byte signatures into base64 strings for transport."""
     if "sig" in frame and isinstance(frame["sig"], bytes):
         frame["sig"] = base64.b64encode(frame["sig"]).decode("ascii")
     return frame
 
 
 def _sign_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the server's RSA signature to a frame."""
     body = proto.canonical_bytes(frame)
     sig = crypto.sign_pss_sha256(SERVER_PRIVATE_PEM, body)
     frame["sig"] = base64.b64encode(sig).decode("ascii")
@@ -103,21 +109,25 @@ def _sign_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_server_frame(frame_type: str, to: str | None, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Create and sign a frame destined for another server."""
     frame = proto.build_frame(frame_type, LOCAL_SERVER_ID, to or "*", payload)
     return _sign_frame(frame)
 
 
 def _build_user_frame(frame_type: str, to: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Create and sign a frame destined for a local user."""
     frame = proto.build_frame(frame_type, LOCAL_SERVER_ID, to, payload)
     return _sign_frame(frame)
 
 
 async def _send_server_frame(dest: str, frame_type: str, payload: Dict[str, Any]) -> bool:
+    """Send a signed frame to another server if we currently know the peer."""
     frame = _build_server_frame(frame_type, dest, payload)
     return await peers.send_to(dest, frame)
 
 
 async def _broadcast_server_frame(frame_type: str, payload: Dict[str, Any], *, exclude: Optional[Iterable[str]] = None) -> None:
+    """Send a server frame to every connected peer, optionally skipping some."""
     excluded = set(exclude or [])
     for server_id in list(peers.known_peers().keys()):
         if server_id == LOCAL_SERVER_ID or server_id in excluded:
@@ -126,10 +136,12 @@ async def _broadcast_server_frame(frame_type: str, payload: Dict[str, Any], *, e
 
 
 async def _presence_broadcast(frame_type: str, payload: Dict[str, Any]) -> None:
+    """Wrapper used by presence.py so it can reuse our broadcast helper."""
     await _broadcast_server_frame(frame_type, payload)
 
 
 async def _heartbeat_loop() -> None:
+    """Periodically ping peers and prune the ones that stop responding."""
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         now = _now_ms()
@@ -139,6 +151,7 @@ async def _heartbeat_loop() -> None:
 
 
 async def _enforce_heartbeat_timeouts(now_ms: int) -> None:
+    """Close connections to peers that have not answered recent heartbeats."""
     expired: list[str] = []
     for server_id, last_seen in list(PEER_LAST_SEEN.items()):
         if now_ms - last_seen > HEARTBEAT_TIMEOUT_MS:
@@ -160,6 +173,7 @@ async def _enforce_heartbeat_timeouts(now_ms: int) -> None:
 
 
 def _ensure_peer_info(server_id: str, payload: Dict[str, Any]) -> None:
+    """Update our peer directory cache using details from a frame."""
     if not server_id:
         return
     uri = payload.get("uri")
@@ -172,6 +186,7 @@ def _ensure_peer_info(server_id: str, payload: Dict[str, Any]) -> None:
 
 
 def _peer_directory() -> list[Dict[str, Any]]:
+    """Return introducer-style records for every peer we know."""
     directory: list[Dict[str, Any]] = []
     for server_id, cfg in peers.known_peers().items():
         entry = dict(cfg)
@@ -183,6 +198,7 @@ def _peer_directory() -> list[Dict[str, Any]]:
 
 
 def _decode_base64(value: str, label: str) -> bytes:
+    """Decode a base64 field and raise a friendly error on failure."""
     try:
         return base64.b64decode(value, validate=True)
     except Exception as exc:
@@ -190,6 +206,7 @@ def _decode_base64(value: str, label: str) -> bytes:
 
 
 def _verify_server_envelope(env: Envelope) -> Optional[str]:
+    """Check that a server-signed envelope carries a valid signature."""
     server_id = env.from_
     payload = env.payload if isinstance(env.payload, dict) else {}
     if server_id:
@@ -210,6 +227,7 @@ def _verify_server_envelope(env: Envelope) -> Optional[str]:
 
 
 async def _register_user_link(link, env: Envelope, meta_hint: Optional[Dict[str, Any]]) -> None:
+    """Associate a websocket link with a user id and gossip their presence."""
     links = ACTIVE[env.from_]
     first = len(links) == 0
     links.add(link)
@@ -221,6 +239,7 @@ async def _register_user_link(link, env: Envelope, meta_hint: Optional[Dict[str,
 
 
 def _decode_chunk(payload: Dict[str, Any]) -> tuple[str, int, bytes, Dict[str, Any]]:
+    """Extract and validate fields from a FILE_CHUNK payload."""
     file_id = payload.get("file_id") or payload.get("manifest", {}).get("file_id")
     if not isinstance(file_id, str):
         raise ValueError("file_id missing")
@@ -239,6 +258,7 @@ def _decode_chunk(payload: Dict[str, Any]) -> tuple[str, int, bytes, Dict[str, A
 
 
 async def _notify_local_file_ready(recipient, manifest: Dict[str, Any], info: Dict[str, Any]) -> None:
+    """Tell a waiting local user that their file finished processing."""
     if recipient is None:
         return
     target = str(recipient)
@@ -260,6 +280,7 @@ async def _notify_local_file_ready(recipient, manifest: Dict[str, Any], info: Di
 
 
 def _is_local_destination(target) -> bool:
+    """Return True if the intended recipient is hosted on this server."""
     if target is None:
         return True
     dest = router.lookup_destination(str(target))
@@ -267,6 +288,7 @@ def _is_local_destination(target) -> bool:
 
 
 async def _handle_file_flow(env: Envelope, link) -> bool:
+    """Process inbound file-transfer frames, returning True when handled."""
     payload = env.payload if isinstance(env.payload, dict) else {}
     if env.type == "FILE_START":
         if not _is_local_destination(env.to):
@@ -313,6 +335,7 @@ async def _handle_file_flow(env: Envelope, link) -> bool:
 
 
 async def _send_to_user_links(user: str, frame: Dict[str, Any]) -> int:
+    """Send a frame to every websocket currently bound to the given user."""
     links = ACTIVE.get(user)
     if not links:
         return 0
@@ -329,6 +352,7 @@ async def _send_to_user_links(user: str, frame: Dict[str, Any]) -> int:
 
 
 async def _deliver_local(env: Envelope) -> int:
+    """Deliver an envelope to local clients and return how many got it."""
     payload = {"envelope": env.to_dict()}
     if env.to is None or (isinstance(env.to, str) and env.to.lower() in {"public", "__public__", "all"}):
         delivered = 0
@@ -342,6 +366,7 @@ async def _deliver_local(env: Envelope) -> int:
 
 
 async def _forward(env: Envelope) -> bool:
+    """Relay an envelope to the appropriate remote server if needed."""
     if env.to is None or (isinstance(env.to, str) and env.to.lower() in {"public", "__public__", "all"}):
         success = False
         for server_id in list(peers.known_peers().keys()):
@@ -368,6 +393,7 @@ async def _forward(env: Envelope) -> bool:
 
 
 async def _lookup_pubkey(username: str) -> Optional[bytes]:
+    """Grab a user's public key from the store or crypto helpers."""
     getter = getattr(store, "get_user_pubkey", None)
     if callable(getter):
         try:
@@ -388,6 +414,7 @@ async def _lookup_pubkey(username: str) -> Optional[bytes]:
 
 
 async def _verify_user_envelope(env: Envelope) -> tuple[Optional[str], Optional[bytes]]:
+    """Check a user envelope signature and return an error string if any."""
     pub = await _lookup_pubkey(env.from_)
     if not pub:
         return "NOT_TRUSTED", None
@@ -398,6 +425,7 @@ async def _verify_user_envelope(env: Envelope) -> tuple[Optional[str], Optional[
 
 
 def _verify_signature_with_key(env: Envelope, pub: bytes) -> Optional[str]:
+    """Verify the envelope signature with the provided public key."""
     if not isinstance(env.sig, str) or not env.sig:
         return "SIG_REQUIRED"
     try:
@@ -411,6 +439,7 @@ def _verify_signature_with_key(env: Envelope, pub: bytes) -> Optional[str]:
 
 
 def _verify_user_message_content(env: Envelope, pub: bytes) -> Optional[str]:
+    """Ensure a MSG_DIRECT payload includes a signed content blob."""
     if env.type not in USER_DIRECT_TYPES:
         return None
     payload = env.payload if isinstance(env.payload, dict) else {}
@@ -426,6 +455,7 @@ def _verify_user_message_content(env: Envelope, pub: bytes) -> Optional[str]:
 
 
 def _parse_user_hello_payload(payload: Dict[str, Any]) -> tuple[str, bytes, Optional[str], Dict[str, Any]]:
+    """Validate and normalise fields included in USER_HELLO."""
     if not isinstance(payload, dict):
         raise ValueError("USER_HELLO payload must be an object")
     client = payload.get("client")
@@ -442,6 +472,7 @@ def _parse_user_hello_payload(payload: Dict[str, Any]) -> tuple[str, bytes, Opti
 
 
 async def _handle_user_hello(env: Envelope, link, payload: Dict[str, Any]) -> None:
+    """Finish binding a websocket to a user after a successful USER_HELLO."""
     existing_binding = getattr(link, "_socp_user", None)
     if existing_binding and existing_binding != env.from_:
         await link.send(_error_frame("BAD_USER", "Link already bound to another user"))
@@ -487,6 +518,7 @@ async def _handle_user_hello(env: Envelope, link, payload: Dict[str, Any]) -> No
 
 
 async def _handle_server_envelope(env: Envelope, link) -> None:
+    """Process frames that arrived from another server."""
     payload = env.payload if isinstance(env.payload, dict) else {}
     server_id = env.from_
     if isinstance(server_id, str) and server_id:
@@ -587,6 +619,7 @@ async def _handle_server_envelope(env: Envelope, link) -> None:
 
 
 def _update_local_server_id(server_id: str) -> None:
+    """Refresh globals when the introducer assigns us a server id."""
     global LOCAL_SERVER_ID
     if server_id and server_id != LOCAL_SERVER_ID:
         LOCAL_SERVER_ID = server_id
@@ -597,6 +630,7 @@ def _update_local_server_id(server_id: str) -> None:
 
 
 async def _handle_peer_disconnect(server_id: str) -> None:
+    """Callback for peers.bootstrap when a remote server link drops."""
     if server_id:
         peers.forget(server_id)
         presence.handle_remote_disconnect(server_id)
@@ -604,6 +638,7 @@ async def _handle_peer_disconnect(server_id: str) -> None:
 
 
 async def _on_disconnect(link) -> None:
+    """Shared websocket disconnect hook for both users and servers."""
     if getattr(link, "kind", None) == "user":
         user = getattr(link, "_socp_user", None)
         if user:
@@ -625,6 +660,7 @@ async def _on_disconnect(link) -> None:
 
 
 def _hello_builder(target_server_id: str, users: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Helper passed to peers.bootstrap to construct hello/announce frames."""
     frame_type = "SERVER_HELLO_JOIN" if entry.get("introducer") else "SERVER_ANNOUNCE"
     payload = {
         "secret": SHARED_SECRET,
@@ -636,6 +672,7 @@ def _hello_builder(target_server_id: str, users: Dict[str, Any], entry: Dict[str
 
 
 async def _process_envelope(env: Envelope, link, *, forwarded: bool = False) -> None:
+    """Core router that handles every inbound envelope from a websocket."""
     ts_err = None
     if not isinstance(env.ts, int):
         ts_err = "TS_TYPE"
@@ -736,6 +773,7 @@ async def _process_envelope(env: Envelope, link, *, forwarded: bool = False) -> 
 
 
 async def main() -> None:
+    """Entrypoint that loads configuration and starts the websocket server."""
     global LOCAL_SERVER_ID, SHARED_SECRET, SSL_CONTEXT, LOCAL_URI
 
     ap = argparse.ArgumentParser()
