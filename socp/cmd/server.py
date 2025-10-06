@@ -657,6 +657,11 @@ async def _on_disconnect(link) -> None:
         if server_id:
             peers.forget(server_id)
             presence.handle_remote_disconnect(server_id)
+            elif getattr(link, "kind", None) == "server":
+                server_id = getattr(link, "peer_id", None)
+                if server_id:
+                    peers.forget(server_id)
+                    presence.handle_remote_disconnect(server_id)
             PEER_LAST_SEEN.pop(server_id, None)
 
 
