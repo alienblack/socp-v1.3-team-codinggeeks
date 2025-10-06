@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Optional
+from . import presence as presence_mod
 import asyncio
 import logging
 import yaml
@@ -95,6 +96,7 @@ class PeerManager:
         self.sign_transport = sign_transport
         self.now = now
         self.on_dead = on_dead
+        self._pending_announce = None
 
         self.server_links: Dict[str, Link] = {}
         self.server_addrs: Dict[str, tuple[str, int]] = {}
@@ -135,6 +137,10 @@ class PeerManager:
             self.sign_transport,
         )
 
+    def list_online_users(self) -> list[str]:
+        """Return a sorted list of known online users for `/list`."""
+        return sorted(self.user_locations.keys())
+    
     def handle_server_welcome(self, env: dict) -> None:
         """Process SERVER_WELCOME from Introducer.
 
@@ -167,6 +173,11 @@ class PeerManager:
                 self.user_locations[uid] = introducer_sid
             except Exception:
                 continue
+            
+        if self._pending_announce:
+            self.broadcast_envelope(self._pending_announce)
+            self._pending_announce = None
+
 
     def make_server_announce(self, my_host: str, my_port: int, my_pubkey_b64: str) -> dict:
         """SERVER_ANNOUNCE — broadcast our address + pubkey to all servers (§8.1)."""
@@ -206,6 +217,33 @@ class PeerManager:
     def make_heartbeat(self, to_server_id: str) -> dict:
         return make_envelope("HEARTBEAT", self.my_server_id, to_server_id, {}, self.sign_transport)
 
+    def _verify_from_server(self, env: dict) -> bool:
+    # Real verify is done in ws.py before calling on_server_frame()
+        return True
+
+    def _fanout_unchanged(self, env: dict) -> None:
+        self.broadcast_envelope(env)
+
+    def _handle_presence_frames(self, env: dict) -> bool:
+        t = env.get("type")
+        if t == "USER_ADVERTISE":
+            return presence_mod.handle_user_advertise(
+                env,
+                my_server_id=self.my_server_id,
+                user_locations=self.user_locations,
+                verify_from_server=self._verify_from_server,
+                fanout=self._fanout_unchanged,
+            )
+        if t == "USER_REMOVE":
+            return presence_mod.handle_user_remove(
+                env,
+                my_server_id=self.my_server_id,
+                user_locations=self.user_locations,
+                verify_from_server=self._verify_from_server,
+                fanout=self._fanout_unchanged,
+            )
+        return False
+
     # ----- ingress from ws.py -----
     def on_server_frame(self, env: dict) -> None:
         """Entry point for each validated server→server frame.
@@ -221,8 +259,8 @@ class PeerManager:
             self.handle_server_welcome(env)
         elif t == "SERVER_ANNOUNCE":
             self.handle_server_announce(env)
-        # elif t == "HEARTBEAT":
-        #     pass  # liveness already updated by note_frame()
+        elif t in ("USER_ADVERTISE", "USER_REMOVE"):
+            self._handle_presence_frames(env)
         else:
             pass
 
@@ -284,7 +322,11 @@ async def bootstrap(
       4) Prepare SERVER_ANNOUNCE to broadcast *after* receiving SERVER_WELCOME.
       5) Start heartbeat loop (application-level) — caller still needs ws integration.
     """
-    pm = PeerManager(my_server_id=my_server_id, sign_transport=sign_transport, on_dead=on_dead)
+    def on_dead_purge(server_id: str):
+    # Called automatically when a peer is marked dead in tick_health()
+        presence_mod.purge_by_hosting_server(server_id, pm.user_locations)
+    
+    pm = PeerManager(my_server_id=my_server_id, sign_transport=sign_transport, on_dead=on_dead_purge)
 
     # 1) Resolve introducers
     introducers: list[dict]
@@ -328,6 +370,7 @@ async def bootstrap(
 
     # 3) Prepare our own announce (broadcast after WELCOME)
     announce = pm.make_server_announce(my_host, my_port, my_pubkey_b64)
+    pm._pending_announce = announce
     log.info("Prepared SERVER_ANNOUNCE (broadcast after WELCOME): %s", announce)
 
     # 4) Start heartbeat loop (timer only; ws send still a stub here)
