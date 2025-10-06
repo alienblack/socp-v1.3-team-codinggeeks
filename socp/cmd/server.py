@@ -1,6 +1,9 @@
 
-import argparse, asyncio, json, os, logging
-from socp.core import ws, router, peers, presence, proto, store, public, files, crypto
+import argparse
+import asyncio
+import logging
+
+from socp.core import crypto, files, peers, presence, proto, public, router, store, ws
 
 log = logging.getLogger("socp.server")
 
@@ -21,12 +24,10 @@ async def main():
     await public.ensure_public_group()
 
     # Start WS server with a simple on_message callback
-    async def on_message(link, frame_text):
-        # TODO: parse envelope, route, verify, etc.
-        log.info("Received frame: %s", frame_text[:200])
+    router_state = router.Router(cfg["server_id"])
 
     log.info("Starting SOCP server on %s:%d", host, port)
-    await ws.serve(host, port, on_message)
+    await ws.serve(host, port, router_state)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
