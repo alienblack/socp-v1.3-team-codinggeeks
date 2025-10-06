@@ -9,7 +9,6 @@ async def main():
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
 
-    # Load config (very simple YAML-like parsing for stub; replace with real yaml later)
     import yaml
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -20,9 +19,26 @@ async def main():
     await store.init(cfg.get("db_path", "socp.db"))
     await public.ensure_public_group()
 
-    # Start WS server with a simple on_message callback
+    reassembler = files.FileReassembler(out_dir="received")
+
     async def on_message(link, frame_text):
-        # TODO: parse envelope, route, verify, etc.
+        try:
+            frame = json.loads(frame_text)
+        except Exception:
+            log.warning("Received non-JSON frame (ignored): %s", frame_text[:200])
+            return
+
+        try:
+            res = files.handle_event(frame, reassembler)
+        except Exception as e:
+            log.exception("Error while handling file frame: %s", e)
+            res = None
+
+        if isinstance(res, tuple) and frame.get("type") == "FILE_END":
+            path, ok = res
+            log.info("Saved incoming file: %s verified=%s", path, ok)
+            return
+
         log.info("Received frame: %s", frame_text[:200])
 
     log.info("Starting SOCP server on %s:%d", host, port)
