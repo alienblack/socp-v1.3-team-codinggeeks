@@ -84,7 +84,7 @@ async def ensure_public_group() -> None:
         return
     await db.execute(
         "INSERT INTO groups(group_id, creator_id, created_at, meta, version) VALUES(?,?,?,?,?)",
-        ("public", "system", int(time.time()), json.dumps({"title": "Public"}), 1),
+        ("public", "system", int(time.time() * 1000), json.dumps({"title": "Public"}), 1),
     )
     await db.commit()
 

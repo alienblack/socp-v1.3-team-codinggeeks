@@ -10,8 +10,9 @@ Key capabilities
 - Fixed JSON envelope (`type`, `from`, `to`, `ts`, `payload`, `sig`) with RSA-PSS signature validation and timestamp policy (±120 s skew, 5 min TTL).
 - Overlay bootstrap and routing using the SOCP v1.3 server flow (`SERVER_HELLO_JOIN` → `SERVER_WELCOME` → `SERVER_ANNOUNCE`) and `SERVER_DELIVER` forwarding frames.
 - Presence gossip across the mesh via `USER_ADVERTISE` / `USER_REMOVE` control messages and signed `USER_LIST` responses.
-- User protocol covering `USER_HELLO`, `USER_MESSAGE`, optional `GROUP_MESSAGE` broadcast (null / `"public"` destinations), and `HEARTBEAT` acknowledgements.
+- User protocol covering `USER_HELLO`, `MSG_DIRECT` direct messages, optional `GROUP_MESSAGE` broadcasts (null / `"public"` destinations), server-signed `USER_DELIVER` deliveries, and `HEARTBEAT` acknowledgements. Millisecond timestamps are used on all envelopes to match the SOCP spec examples.
 - File transfer pipeline with `FILE_START`, `FILE_CHUNK`, `FILE_END`, size accounting, SHA-256 verification, and a lab-only insecure sink guarded by backdoor toggles.
+- Public channel management implementing `PUBLIC_CHANNEL_ADD`, `PUBLIC_CHANNEL_UPDATED`, and `PUBLIC_CHANNEL_KEY_SHARE` so that the shared channel key is versioned, wrapped for each member, and synchronised across the overlay.
 
 Installation
 ------------
@@ -53,12 +54,14 @@ Client scripts & workflow
 
        python listen_bob.py --server ws://127.0.0.1:7002 --user bob --private-key bob_private.pem --list-once
 
-2. Send a signed message (`USER_HELLO` + `USER_MESSAGE` + optional `USER_LIST` request):
+2. Send a signed message (`USER_HELLO` + `MSG_DIRECT` + optional `USER_LIST` request):
 
        python send_signed_alice.py "Hello Bob" bob \
            --server ws://127.0.0.1:7001 --user alice --private-key alice_private.pem --list-after
 
    The scripts sign every envelope and attach a per-message `content_sig` over the UTF-8 payload. Adjust `--server` endpoints to target either node; overlay forwarding uses `SERVER_DELIVER` frames when the recipient is remote.
+
+   `USER_HELLO` payloads now include both a `client` identifier and the sender's PEM `pubkey`, which the helper scripts derive automatically from the provided private key. Servers reject duplicate user IDs whose stored keys differ.
 
 Secure file transfer demo
 -------------------------
