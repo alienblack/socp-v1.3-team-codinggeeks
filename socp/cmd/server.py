@@ -1,32 +1,685 @@
+import argparse
+import asyncio
+import base64
+import json
+import logging
+import os
+import ssl
+import time
+from collections import defaultdict
+from typing import Any, Dict, Iterable, Optional
 
-import argparse, asyncio, json, os, logging
-from socp.core import ws, router, peers, presence, proto, store, public, files, crypto
+import yaml
+
+from socp.core import crypto, files, peers, presence, proto, public, router, store, ws
+from socp.core.proto import Envelope
 
 log = logging.getLogger("socp.server")
 
-async def main():
+CLOCK_SKEW_SEC = 120
+MAX_AGE_SEC = 300
+HEARTBEAT_INTERVAL = 25
+DEFAULT_SHARED_SECRET = "socp-shared-secret"
+
+ACTIVE: dict[str, set] = defaultdict(set)
+LOCAL_SERVER_ID = "unknown"
+LOCAL_URI = ""
+SHARED_SECRET = DEFAULT_SHARED_SECRET
+SSL_CONTEXT: Optional[ssl.SSLContext] = None
+
+SERVER_PRIVATE_PEM: bytes = b""
+SERVER_PUBLIC_PEM: bytes = b""
+SERVER_PUBLIC_TEXT: str = ""
+
+BACKGROUND_TASKS: list[asyncio.Task] = []
+
+SERVER_MESSAGE_TYPES = {
+    "SERVER_HELLO_JOIN",
+    "SERVER_WELCOME",
+    "SERVER_ANNOUNCE",
+    "SERVER_DELIVER",
+    "SERVER_HEARTBEAT",
+    "SERVER_HEARTBEAT_ACK",
+    "USER_ADVERTISE",
+    "USER_REMOVE",
+    "USER_LIST_RESPONSE",
+}
+
+
+def _load_key_material(value: Optional[str]) -> bytes:
+    if not value:
+        raise ValueError("key path or value not provided")
+    if "BEGIN" in value:
+        return value.encode("utf-8")
+    path = os.path.expanduser(value)
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _load_server_keys(cfg: Dict[str, Any]) -> None:
+    global SERVER_PRIVATE_PEM, SERVER_PUBLIC_PEM, SERVER_PUBLIC_TEXT
+    priv_path = cfg.get("server_private_key")
+    pub_path = cfg.get("server_public_key")
+    if not priv_path or not pub_path:
+        raise RuntimeError("server_private_key and server_public_key must be set in the config")
+    SERVER_PRIVATE_PEM = _load_key_material(priv_path)
+    SERVER_PUBLIC_PEM = _load_key_material(pub_path)
+    SERVER_PUBLIC_TEXT = SERVER_PUBLIC_PEM.decode("utf-8")
+
+
+def _error_frame(code: str, reason: str, ref: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "type": "ERROR",
+        "from": LOCAL_SERVER_ID,
+        "to": None,
+        "ts": int(time.time()),
+        "payload": {"code": code, "reason": reason, "ref": ref},
+        "sig": "",
+    }
+
+
+def _encode_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
+    if "sig" in frame and isinstance(frame["sig"], bytes):
+        frame["sig"] = base64.b64encode(frame["sig"]).decode("ascii")
+    return frame
+
+
+def _sign_frame(frame: Dict[str, Any]) -> Dict[str, Any]:
+    body = proto.canonical_bytes(frame)
+    sig = crypto.sign_pss_sha256(SERVER_PRIVATE_PEM, body)
+    frame["sig"] = base64.b64encode(sig).decode("ascii")
+    return frame
+
+
+def _build_server_frame(frame_type: str, to: str | None, payload: Dict[str, Any]) -> Dict[str, Any]:
+    frame = proto.build_frame(frame_type, LOCAL_SERVER_ID, to or "*", payload)
+    return _sign_frame(frame)
+
+
+async def _send_server_frame(dest: str, frame_type: str, payload: Dict[str, Any]) -> bool:
+    frame = _build_server_frame(frame_type, dest, payload)
+    return await peers.send_to(dest, frame)
+
+
+async def _broadcast_server_frame(frame_type: str, payload: Dict[str, Any], *, exclude: Optional[Iterable[str]] = None) -> None:
+    excluded = set(exclude or [])
+    for server_id in list(peers.known_peers().keys()):
+        if server_id == LOCAL_SERVER_ID or server_id in excluded:
+            continue
+        await _send_server_frame(server_id, frame_type, payload)
+
+
+async def _presence_broadcast(frame_type: str, payload: Dict[str, Any]) -> None:
+    await _broadcast_server_frame(frame_type, payload)
+
+
+async def _heartbeat_loop() -> None:
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+        payload = {"ts": int(time.time())}
+        await _broadcast_server_frame("SERVER_HEARTBEAT", payload)
+
+
+def _ensure_peer_info(server_id: str, payload: Dict[str, Any]) -> None:
+    if not server_id:
+        return
+    uri = payload.get("uri")
+    if uri:
+        peers.add_peer_entry({"server_id": server_id, "uri": uri})
+        router.note_remote_server(server_id, uri)
+    server_pub = payload.get("server_pub")
+    if isinstance(server_pub, str) and "BEGIN" in server_pub:
+        peers.set_peer_key(server_id, server_pub.encode("utf-8"))
+
+
+def _peer_directory() -> list[Dict[str, Any]]:
+    directory: list[Dict[str, Any]] = []
+    for server_id, cfg in peers.known_peers().items():
+        entry = dict(cfg)
+        key = peers.get_peer_key(server_id)
+        if key:
+            entry["public_key"] = key.decode("utf-8")
+        directory.append(entry)
+    return directory
+
+
+def _decode_base64(value: str, label: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception as exc:
+        raise ValueError(f"{label} invalid base64") from exc
+
+
+def _verify_server_envelope(env: Envelope) -> Optional[str]:
+    server_id = env.from_
+    payload = env.payload if isinstance(env.payload, dict) else {}
+    if server_id:
+        _ensure_peer_info(server_id, payload)
+    key = peers.get_peer_key(server_id)
+    if not key:
+        return "SERVER_KEY_UNKNOWN"
+    if not isinstance(env.sig, str) or not env.sig:
+        return "SERVER_SIG_MISSING"
+    try:
+        sig_bytes = base64.b64decode(env.sig, validate=True)
+    except Exception:
+        return "SERVER_SIG_FORMAT"
+    body = proto.canonical_bytes(env)
+    if not crypto.verify_pss_sha256(key, body, sig_bytes):
+        return "SERVER_SIG_INVALID"
+    return None
+
+
+async def _register_user_link(link, env: Envelope, meta_hint: Optional[Dict[str, Any]]) -> None:
+    links = ACTIVE[env.from_]
+    first = len(links) == 0
+    links.add(link)
+    link.kind = "user"
+    setattr(link, "_socp_user", env.from_)
+    if first:
+        await presence.on_user_local_join(env.from_, meta_hint or {})
+    log.info("bound link to user=%s (connections=%d)", env.from_, len(links))
+
+
+def _decode_chunk(payload: Dict[str, Any]) -> tuple[str, int, bytes, Dict[str, Any]]:
+    file_id = payload.get("file_id") or payload.get("manifest", {}).get("file_id")
+    if not isinstance(file_id, str):
+        raise ValueError("file_id missing")
+    chunk_index = payload.get("chunk_index")
+    if not isinstance(chunk_index, int):
+        raise ValueError("chunk_index missing")
+    chunk_b64 = payload.get("chunk")
+    if not isinstance(chunk_b64, str):
+        raise ValueError("chunk missing")
+    chunk_bytes = _decode_base64(chunk_b64, "chunk")
+    manifest = payload.get("manifest")
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest missing")
+    manifest.setdefault("file_id", file_id)
+    return file_id, chunk_index, chunk_bytes, manifest
+
+
+async def _notify_local_file_ready(recipient, manifest: Dict[str, Any], info: Dict[str, Any]) -> None:
+    if recipient is None:
+        return
+    target = str(recipient)
+    links = ACTIVE.get(target)
+    if not links:
+        return
+    payload = {
+        "file_id": manifest.get("file_id"),
+        "name": manifest.get("name"),
+        "size": manifest.get("size"),
+        "path": info.get("path"),
+        "status": info.get("status"),
+    }
+    for link in list(links):
+        try:
+            await link.send({"type": "SERVER_FILE_READY", "payload": payload})
+        except Exception:
+            links.discard(link)
+
+
+def _is_local_destination(target) -> bool:
+    if target is None:
+        return True
+    dest = router.lookup_destination(str(target))
+    return dest in (None, "local")
+
+
+async def _handle_file_flow(env: Envelope, link) -> bool:
+    payload = env.payload if isinstance(env.payload, dict) else {}
+    if env.type == "FILE_START":
+        if not _is_local_destination(env.to):
+            return False
+        manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else payload
+        manifest = dict(manifest)
+        file_id = manifest.get("file_id") or payload.get("file_id")
+        if not isinstance(file_id, str):
+            await link.send({"type": "FILE_STATUS", "payload": {"status": "error", "reason": "file_id missing"}})
+            return True
+        manifest["file_id"] = file_id
+        try:
+            res = files.begin_file_transfer(file_id, manifest, sender=env.from_)
+            await link.send({"type": "FILE_STATUS", "payload": {"file_id": file_id, **res}})
+        except Exception as exc:
+            await link.send({"type": "FILE_STATUS", "payload": {"status": "error", "reason": str(exc)}})
+        return True
+    if env.type == "FILE_CHUNK":
+        if not _is_local_destination(env.to):
+            return False
+        try:
+            file_id, chunk_idx, chunk_bytes, manifest = _decode_chunk(payload)
+            res = files.accept_file_chunk(file_id, chunk_idx, chunk_bytes, manifest, env.from_)
+            await link.send({"type": "FILE_STATUS", "payload": {"file_id": file_id, **res}})
+        except Exception as exc:
+            await link.send({"type": "FILE_STATUS", "payload": {"status": "error", "reason": str(exc)}})
+        return True
+    if env.type == "FILE_END":
+        if not _is_local_destination(env.to):
+            return False
+        manifest = payload if isinstance(payload, dict) else {}
+        file_id = manifest.get("file_id")
+        if not isinstance(file_id, str):
+            await link.send({"type": "FILE_STATUS", "payload": {"status": "error", "reason": "file_id missing"}})
+            return True
+        try:
+            info = files.complete_file_transfer(file_id, manifest)
+            await link.send({"type": "FILE_STATUS", "payload": info})
+            await _notify_local_file_ready(env.to, manifest, info)
+        except Exception as exc:
+            await link.send({"type": "FILE_STATUS", "payload": {"status": "error", "reason": str(exc)}})
+        return True
+    return False
+
+
+async def _deliver_local(env: Envelope) -> int:
+    delivered = 0
+    if env.to is None or (isinstance(env.to, str) and env.to.lower() in {"public", "__public__", "all"}):
+        for uname, links in list(ACTIVE.items()):
+            for lnk in list(links):
+                try:
+                    await lnk.send({"type": "SERVER_DELIVER", "payload": env.to_dict()})
+                    delivered += 1
+                except Exception:
+                    links.discard(lnk)
+        return delivered
+    target = str(env.to)
+    links = ACTIVE.get(target)
+    if not links:
+        return 0
+    for lnk in list(links):
+        try:
+            await lnk.send({"type": "SERVER_DELIVER", "payload": env.to_dict()})
+            delivered += 1
+        except Exception:
+            links.discard(lnk)
+    return delivered
+
+
+async def _forward(env: Envelope) -> bool:
+    if env.to is None or (isinstance(env.to, str) and env.to.lower() in {"public", "__public__", "all"}):
+        success = False
+        for server_id in list(peers.known_peers().keys()):
+            if server_id == LOCAL_SERVER_ID:
+                continue
+            frame = _build_server_frame(
+                "SERVER_DELIVER",
+                server_id,
+                {"envelope": env.to_dict()},
+            )
+            sent = await peers.send_to(server_id, frame)
+            success = success or sent
+        return success
+    target = router.lookup_destination(str(env.to))
+    if not target or target == "local":
+        return False
+    frame = _build_server_frame(
+        "SERVER_DELIVER",
+        target,
+        {"envelope": env.to_dict()},
+    )
+    await peers.ensure_connected(target)
+    return await peers.send_to(target, frame)
+
+
+async def _lookup_pubkey(username: str) -> Optional[bytes]:
+    getter = getattr(store, "get_user_pubkey", None)
+    if callable(getter):
+        try:
+            result = await getter(username) if asyncio.iscoroutinefunction(getter) else getter(username)
+            if result:
+                return result if isinstance(result, bytes) else str(result).encode("utf-8")
+        except Exception:
+            log.exception("store.get_user_pubkey failed")
+    peers_getter = getattr(crypto, "get_pubkey", None)
+    if callable(peers_getter):
+        try:
+            result = await peers_getter(username) if asyncio.iscoroutinefunction(peers_getter) else peers_getter(username)
+            if result:
+                return result if isinstance(result, bytes) else str(result).encode("utf-8")
+        except Exception:
+            log.exception("peers crypto get_pubkey failed")
+    return None
+
+
+async def _verify_user_envelope(env: Envelope) -> tuple[Optional[str], Optional[bytes]]:
+    pub = await _lookup_pubkey(env.from_)
+    if not pub:
+        return "NOT_TRUSTED", None
+    if not isinstance(env.sig, str) or not env.sig:
+        return "SIG_REQUIRED", None
+    try:
+        sig_bytes = base64.b64decode(env.sig, validate=True)
+    except Exception:
+        return "SIG_FORMAT", None
+    msg = proto.canonical_bytes(env)
+    if not crypto.verify_pss_sha256(pub, msg, sig_bytes):
+        return "SIG_BAD", None
+    return None, pub
+
+
+def _verify_user_message_content(env: Envelope, pub: bytes) -> Optional[str]:
+    if env.type != "USER_MESSAGE":
+        return None
+    payload = env.payload if isinstance(env.payload, dict) else {}
+    content_b64 = payload.get("content")
+    sig_b64 = payload.get("content_sig")
+    if not isinstance(content_b64, str) or not isinstance(sig_b64, str):
+        return "CONTENT_SIG_REQUIRED"
+    content_bytes = _decode_base64(content_b64, "content")
+    sig_bytes = _decode_base64(sig_b64, "content_sig")
+    if not crypto.verify_pss_sha256(pub, content_bytes, sig_bytes):
+        return "CONTENT_SIG_INVALID"
+    return None
+
+
+async def _handle_server_envelope(env: Envelope, link) -> None:
+    payload = env.payload if isinstance(env.payload, dict) else {}
+    server_id = env.from_
+    if env.type == "SERVER_HELLO_JOIN":
+        secret = payload.get("secret")
+        if secret != SHARED_SECRET:
+            await link.send(_error_frame("AUTH_FAILED", "Shared secret mismatch"))
+            await link.ws.close(code=4003)
+            return
+        peers.track_incoming(server_id, link)
+        _ensure_peer_info(server_id, payload)
+        users = payload.get("users") if isinstance(payload.get("users"), dict) else {}
+        presence.handle_remote_snapshot(server_id, users or {})
+        welcome_payload = {
+            "users": presence.snapshot_local_users(),
+            "peers": _peer_directory(),
+            "server_pub": SERVER_PUBLIC_TEXT,
+            "uri": LOCAL_URI,
+        }
+        await _send_server_frame(server_id, "SERVER_WELCOME", welcome_payload)
+        return
+    if env.type == "SERVER_WELCOME":
+        assigned = payload.get("assigned_id")
+        if isinstance(assigned, str) and assigned:
+            _update_local_server_id(assigned)
+        _ensure_peer_info(server_id, payload)
+        peers.track_incoming(server_id, link)
+        users = payload.get("users") if isinstance(payload.get("users"), dict) else {}
+        presence.handle_remote_snapshot(server_id, users or {})
+        peers.merge_peer_configs(payload.get("peers") or [])
+        await _broadcast_server_frame(
+            "SERVER_ANNOUNCE",
+            {
+                "server_id": LOCAL_SERVER_ID,
+                "users": presence.snapshot_local_users(),
+                "uri": LOCAL_URI,
+                "server_pub": SERVER_PUBLIC_TEXT,
+            },
+            exclude={server_id},
+        )
+        return
+    if env.type == "SERVER_ANNOUNCE":
+        announced_id = payload.get("server_id") or server_id
+        if isinstance(announced_id, str):
+            peers.add_peer_entry({"server_id": announced_id, "uri": payload.get("uri")})
+            router.note_remote_server(announced_id, payload.get("uri"))
+            server_pub = payload.get("server_pub")
+            if isinstance(server_pub, str) and "BEGIN" in server_pub:
+                peers.set_peer_key(announced_id, server_pub.encode("utf-8"))
+            users = payload.get("users") if isinstance(payload.get("users"), dict) else {}
+            presence.handle_remote_snapshot(announced_id, users or {})
+        return
+    if env.type == "SERVER_DELIVER":
+        inner = payload.get("envelope")
+        if isinstance(inner, dict):
+            try:
+                inner_env = Envelope(**inner)
+            except ValueError:
+                return
+            await _process_envelope(inner_env, link, forwarded=True)
+        return
+    if env.type == "SERVER_HEARTBEAT":
+        await _send_server_frame(server_id, "SERVER_HEARTBEAT_ACK", {"ts": int(time.time())})
+        return
+    if env.type == "SERVER_HEARTBEAT_ACK":
+        return
+    if env.type == "USER_ADVERTISE":
+        presence.handle_remote_join(payload.get("server_id"), payload.get("user"), payload.get("meta"))
+        return
+    if env.type == "USER_REMOVE":
+        presence.handle_remote_leave(payload.get("server_id"), payload.get("user"))
+        return
+    if env.type == "USER_LIST_RESPONSE":
+        server_id = payload.get("server_id") or env.from_
+        users = payload.get("users") if isinstance(payload.get("users"), dict) else {}
+        local_users = users.get("local") if isinstance(users.get("local"), dict) else {}
+        if isinstance(server_id, str):
+            presence.handle_remote_snapshot(server_id, local_users)
+        return
+    log.warning("Unhandled server envelope type %s", env.type)
+
+
+def _update_local_server_id(server_id: str) -> None:
+    global LOCAL_SERVER_ID
+    if server_id and server_id != LOCAL_SERVER_ID:
+        LOCAL_SERVER_ID = server_id
+        router.configure(LOCAL_SERVER_ID)
+        presence.configure(LOCAL_SERVER_ID, _presence_broadcast)
+        peers.set_local_id(LOCAL_SERVER_ID)
+
+
+async def _handle_peer_disconnect(server_id: str) -> None:
+    if server_id:
+        peers.forget(server_id)
+        presence.handle_remote_disconnect(server_id)
+
+
+async def _on_disconnect(link) -> None:
+    if getattr(link, "kind", None) == "user":
+        user = getattr(link, "_socp_user", None)
+        if user:
+            links = ACTIVE.get(user)
+            if links:
+                links.discard(link)
+                if not links:
+                    ACTIVE.pop(user, None)
+                    await presence.on_user_local_leave(user)
+    elif getattr(link, "kind", None) == "server":
+        server_id = getattr(link, "peer_id", None)
+        if server_id:
+            peers.forget(server_id)
+            presence.handle_remote_disconnect(server_id)
+
+
+def _hello_builder(target_server_id: str, users: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
+    frame_type = "SERVER_HELLO_JOIN" if entry.get("introducer") else "SERVER_ANNOUNCE"
+    payload = {
+        "secret": SHARED_SECRET,
+        "users": users,
+        "uri": LOCAL_URI,
+        "server_pub": SERVER_PUBLIC_TEXT,
+    }
+    return _build_server_frame(frame_type, target_server_id or entry.get("server_id"), payload)
+
+
+async def _process_envelope(env: Envelope, link, *, forwarded: bool = False) -> None:
+    ts_err = None
+    if not isinstance(env.ts, int):
+        ts_err = "TS_TYPE"
+    else:
+        now = int(time.time())
+        if env.ts > now + CLOCK_SKEW_SEC:
+            ts_err = "TS_IN_FUTURE"
+        elif now - env.ts > MAX_AGE_SEC:
+            ts_err = "TS_TOO_OLD"
+    if ts_err:
+        if not forwarded:
+            await link.send(_error_frame("BAD_TS", ts_err))
+        return
+
+    if env.type in SERVER_MESSAGE_TYPES:
+        sig_err = _verify_server_envelope(env)
+        if sig_err:
+            await link.send(_error_frame("BAD_SIG", sig_err))
+            return
+        await _handle_server_envelope(env, link)
+        return
+
+    error_code, pub = await _verify_user_envelope(env)
+    if error_code:
+        if not forwarded:
+            await link.send(_error_frame("BAD_SIG", error_code))
+        return
+
+    content_err = _verify_user_message_content(env, pub)
+    if content_err:
+        await link.send(_error_frame("BAD_CONTENT_SIG", content_err))
+        return
+
+    meta_hint = None
+    if env.type == "USER_HELLO" and isinstance(env.payload, dict):
+        meta_hint = env.payload.get("meta") if isinstance(env.payload.get("meta"), dict) else env.payload
+    await _register_user_link(link, env, meta_hint)
+
+    payload_obj = env.payload if isinstance(env.payload, dict) else {}
+    if not router.should_bypass_dedupe(payload_obj):
+        target = env.to if env.to is not None else "__broadcast__"
+        key = router.dedupe_key(env.ts, env.from_, str(target), payload_obj)
+        if key in router.SEEN_IDS:
+            return
+        router.SEEN_IDS.add(key)
+
+    if await _handle_file_flow(env, link):
+        return
+
+    if env.type in {"USER_LIST", "USER_LIST_MEMBERS", "LIST", "LIST_MEMBERS"}:
+        response = _build_server_frame(
+            "USER_LIST_RESPONSE",
+            env.from_,
+            {
+                "server_id": LOCAL_SERVER_ID,
+                "users": presence.list_online(),
+            },
+        )
+        await link.send(response)
+        return
+
+    if env.type == "HEARTBEAT":
+        ack = _build_server_frame("HEARTBEAT_ACK", env.from_, {"ts": int(time.time())})
+        await link.send(ack)
+        return
+
+    if env.type == "USER_MESSAGE" and env.payload:
+        log.info("USER_MESSAGE %s -> %s", env.from_, env.to)
+
+    delivered = await _deliver_local(env)
+    if delivered > 0:
+        if not forwarded:
+            ack = _build_server_frame("ACK", env.from_, {"delivered": delivered})
+            await link.send(ack)
+        return
+
+    forwarded_ok = await _forward(env)
+    if forwarded_ok:
+        if not forwarded:
+            ack = _build_server_frame("ACK", env.from_, {"forwarded": True})
+            await link.send(ack)
+        return
+
+    if not forwarded:
+        await link.send(_error_frame("NO_ROUTE", "Destination not local and no forwarder available"))
+
+
+async def main() -> None:
+    global LOCAL_SERVER_ID, SHARED_SECRET, SSL_CONTEXT, LOCAL_URI
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
 
-    # Load config (very simple YAML-like parsing for stub; replace with real yaml later)
-    import yaml
     with open(args.config, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
 
-    host, port = cfg["listen"].split(":")
-    port = int(port)
+    _load_server_keys(cfg)
+
+    LOCAL_SERVER_ID = cfg.get("server_id", LOCAL_SERVER_ID)
+    SHARED_SECRET = cfg.get("shared_secret", DEFAULT_SHARED_SECRET)
+    vulns = cfg.get("vulns", {})
+    os.environ["VULN_WEAK_KEYS"] = "1" if vulns.get("weak_keys", False) else "0"
+    os.environ["VULN_REPLAY"] = "1" if vulns.get("replay_bypass", False) else "0"
+
+    host_str = cfg.get("listen", "127.0.0.1:8080")
+    host, port_s = host_str.split(":")
+    port = int(port_s)
+    LOCAL_URI = f"ws://{host}:{port}"
+
+    tls_cfg = cfg.get("tls")
+    if isinstance(tls_cfg, dict) and tls_cfg.get("certfile") and tls_cfg.get("keyfile"):
+        SSL_CONTEXT = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        SSL_CONTEXT.load_cert_chain(tls_cfg["certfile"], tls_cfg["keyfile"], password=tls_cfg.get("password"))
 
     await store.init(cfg.get("db_path", "socp.db"))
     await public.ensure_public_group()
 
-    # Start WS server with a simple on_message callback
-    async def on_message(link, frame_text):
-        # TODO: parse envelope, route, verify, etc.
-        log.info("Received frame: %s", frame_text[:200])
+    _update_local_server_id(LOCAL_SERVER_ID)
+
+    bootstrap_entries = cfg.get("bootstrap_file")
+    entries = []
+    if bootstrap_entries:
+        with open(bootstrap_entries, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        raw_servers: list[Dict[str, Any]] = []
+        if isinstance(data, dict):
+            raw_servers.extend(data.get("introducers", []))
+            raw_servers.extend(data.get("servers", []))
+        elif isinstance(data, list):
+            raw_servers.extend(data)
+        for entry in raw_servers:
+            if not isinstance(entry, dict):
+                continue
+            item = dict(entry)
+            if "uri" not in item:
+                listen = item.get("listen")
+                if listen:
+                    item["uri"] = listen
+                elif item.get("host") and item.get("port"):
+                    item["uri"] = f"ws://{item['host']}:{item['port']}"
+            entries.append(item)
+
+    async def on_message(link, frame_text: str) -> None:
+        try:
+            obj = json.loads(frame_text)
+        except json.JSONDecodeError as exc:
+            await link.send(_error_frame("BAD_JSON", f"Invalid JSON: {exc.msg}"))
+            return
+
+        try:
+            env = Envelope(**obj)
+        except ValueError as exc:
+            await link.send(_error_frame("BAD_ENVELOPE", "Envelope schema invalid", ref=str(exc)))
+            return
+
+        await _process_envelope(env, link)
+
+    await peers.bootstrap(
+        LOCAL_SERVER_ID,
+        SHARED_SECRET,
+        entries,
+        on_message,
+        _handle_peer_disconnect,
+        presence.snapshot_local_users,
+        _hello_builder,
+    )
+
+    heartbeat_task = asyncio.create_task(_heartbeat_loop())
+    BACKGROUND_TASKS.append(heartbeat_task)
 
     log.info("Starting SOCP server on %s:%d", host, port)
-    await ws.serve(host, port, on_message)
+    await ws.serve(
+        host,
+        port,
+        on_message,
+        on_disconnect_cb=_on_disconnect,
+        ssl=SSL_CONTEXT,
+    )
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

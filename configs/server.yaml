@@ -1,11 +1,14 @@
-
 server_id: "00000000-0000-4000-8000-000000000001"
 listen: "0.0.0.0:7001"
 db_path: "socp.db"
-advertise_pubkey: ""
+shared_secret: "socp-class-shared"
+server_private_key: "configs/keys/server_a_private.pem"
+server_public_key: "configs/keys/server_a_public.pem"
 bootstrap_file: "configs/bootstrap.yaml"
-heartbeat_secs: 15
-dead_after_secs: 45
 vulns:
   weak_keys: true
   replay_bypass: true
+# Uncomment and set cert paths to enable TLS
+# tls:
+#   certfile: "path/to/cert.pem"
+#   keyfile: "path/to/key.pem"
