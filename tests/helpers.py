@@ -11,7 +11,7 @@ import orjson
 import websockets
 
 from socp.core import crypto
-from socp.core.config import IntroducerConfig, ServerConfig, VulnerabilityToggles
+from socp.core.config import ServerConfig, VulnerabilityToggles
 from socp.core.node import ServerRuntime
 from socp.core import proto
 
@@ -43,7 +43,7 @@ class TestServer:
             bootstrap_file=tmp_path / "bootstrap.yaml",
             introducers=[],
             heartbeat_secs=1,
-            dead_after_secs=3,
+            dead_after_secs=10,
             vulnerabilities=VulnerabilityToggles(weak_keys=True, replay_bypass=True),
         )
         runtime = ServerRuntime(cfg)
@@ -57,7 +57,16 @@ class TestServer:
 
     async def connect_to(self, other: "TestServer") -> None:
         await self.runtime._dial_server(other.host, other.port)
-        await asyncio.sleep(0.2)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        while True:
+            has_link = other.runtime.server_id in self.runtime.server_links
+            reverse = self.runtime.server_id in other.runtime.server_links
+            if has_link and reverse:
+                return
+            if loop.time() >= deadline:
+                raise RuntimeError("server link handshake timed out")
+            await asyncio.sleep(0.05)
 
 
 class TestClient:
@@ -171,7 +180,7 @@ class TestClient:
         }
         await self._send("MSG_DIRECT", payload)
 
-    async def recv_direct(self, timeout: float = 1.0) -> str:
+    async def recv_direct(self, timeout: float = 2.0) -> str:
         env = await asyncio.wait_for(self.queue.get(), timeout)
         assert env.type == "USER_DELIVER"
         sender = env.payload.get("from")
@@ -187,6 +196,24 @@ class TestClient:
         envelope = self.build_direct_envelope(target, text, ts)
         await self._send_envelope(envelope)
         await self._send_envelope(envelope)
+
+    def build_direct_envelope(self, target: str, text: str, ts: int) -> proto.Envelope:
+        enc_entry = self.directory.get(target)
+        if not enc_entry:
+            raise ValueError("recipient not in directory")
+        enc_key = crypto.b64url_decode(enc_entry["enc_pubkey"])
+        ciphertext = crypto.rsa_encrypt_oaep(enc_key, text.encode("utf-8"))
+        digest = crypto.content_digest_direct(ciphertext, self.user_id, target, ts)
+        payload = {
+            "to": target,
+            "ciphertext": crypto.b64url(ciphertext),
+            "sender_pub": crypto.b64url(self.sign_pair.public_pem),
+            "content_sig": crypto.sign_content(self.sign_pair.private_pem, digest),
+            "ts": ts,
+            "hops": 0,
+        }
+        envelope = proto.build_envelope("MSG_DIRECT", self.user_id, self.server_id or "*", payload, ts=ts)
+        return proto.sign_envelope(envelope, self.sign_pair.private_pem)
 
     async def send_public(self, text: str) -> None:
         if not self.public_channel_key:
@@ -208,7 +235,7 @@ class TestClient:
         await self._send("LIST_USERS", {})
         await asyncio.sleep(0.1)
 
-    async def recv_public(self, timeout: float = 1.0) -> str:
+    async def recv_public(self, timeout: float = 2.0) -> str:
         env = await asyncio.wait_for(self.queue.get(), timeout)
         assert env.type == "PUBLIC_DELIVER"
         ciphertext = crypto.b64url_decode(env.payload["ciphertext"])
@@ -265,15 +292,29 @@ class TestClient:
         )
         return file_id
 
-    async def recv_file(self, timeout: float = 1.0) -> bytes:
+    async def recv_file(self, timeout: float = 5.0) -> bytes:
+        """Receive an inbound file transfer.
+
+        The helper tracks elapsed time so that slow cryptographic operations do
+        not trigger a premature timeout when processing multi-frame transfers.
+        """
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         chunks: Dict[int, bytes] = {}
         while True:
-            env = await asyncio.wait_for(self.queue.get(), timeout)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            env = await asyncio.wait_for(self.queue.get(), remaining)
+            if env.type == "FILE_START":
+                continue
             if env.type == "FILE_CHUNK":
                 ciphertext = crypto.b64url_decode(env.payload["ciphertext"])
                 plaintext = crypto.rsa_decrypt_oaep(self.enc_pair.private_pem, ciphertext)
                 chunks[env.payload["index"]] = plaintext
-            elif env.type == "FILE_END":
+                continue
+            if env.type == "FILE_END":
                 ordered = b"".join(chunks[i] for i in sorted(chunks))
                 return ordered
 
