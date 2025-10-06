@@ -83,3 +83,34 @@ def sign_content(privkey_pem: bytes, ciphertext: bytes, from_id: str, to_id: str
 def verify_content(pubkey_pem: bytes, ciphertext: bytes, from_id: str, to_id: str, ts_ms: int, sig: bytes) -> bool:
     msg = content_sig_bytes(ciphertext, from_id, to_id, ts_ms)
     return verify_pss_sha256(pubkey_pem, msg, sig)
+# socp/core/crypto.py
+def decrypt_and_verify_dm(sender_pub_pem, recipient_priv_pem, b64_ciphertext, from_id, to_id, ts_ms, b64_content_sig):
+    ct = b64url_to_bytes(b64_ciphertext)
+    sig = b64url_to_bytes(b64_content_sig)
+    if not verify_content(sender_pub_pem, ct, from_id, to_id, ts_ms, sig):
+        return None
+    return rsa_decrypt_oaep(recipient_priv_pem, ct)
+
+from cryptography.hazmat.primitives import serialization
+
+def generate_rsa_keypair(bits: int = 4096):
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+    pub = priv.public_key()
+    priv_pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_pem = pub.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return priv_pem, pub_pem
+
+def save_pem(path: str, pem: bytes):
+    with open(path, "wb") as f:
+        f.write(pem)
+
+def load_pem(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()

@@ -36,4 +36,4 @@ Environment flags (default to ON in .env.example):
 
 Clean build: set both to 0 (or unset) and enforce strict checks.
 
-Generated on: 2025-09-27T07:33:58.199436
+Generated on: 2025-09-27T07:33:58.199436   
