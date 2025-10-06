@@ -148,7 +148,7 @@ async def _send_hello(link: ClientLink, entry: Dict[str, Any]) -> None:
         "server_id": _LOCAL_ID,
         "secret": _SHARED_SECRET,
         "users": users,
-        "ts": int(time.time()),
+        "ts": int(time.time() * 1000),
     }
     uri = entry.get("uri")
     if uri:
