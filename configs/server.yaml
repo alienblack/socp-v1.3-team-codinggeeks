@@ -1,8 +1,7 @@
-
 server_id: "00000000-0000-4000-8000-000000000001"
-listen: "0.0.0.0:7001"
+listen: "127.0.0.1:7001"
 db_path: "socp.db"
-advertise_pubkey: ""
+key_dir: "../keys/server_a"
 bootstrap_file: "configs/bootstrap.yaml"
 heartbeat_secs: 15
 dead_after_secs: 45

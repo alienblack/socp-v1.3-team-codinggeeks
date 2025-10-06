@@ -1,10 +1,9 @@
-
 websockets
 cryptography
 orjson
 pydantic
 pyyaml
-uvloop==0.19.0
 aiosqlite
 click
 pytest
+pytest-asyncio

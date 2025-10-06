@@ -1,5 +1,10 @@
-
 introducers:
   - host: "127.0.0.1"
     port: 7001
-    pubkey: "BASE64URL_RSA4096_PUB_OF_INTRODUCER"
+    pubkey: ""
+  - host: "127.0.0.1"
+    port: 7002
+    pubkey: ""
+  - host: "127.0.0.1"
+    port: 7003
+    pubkey: ""

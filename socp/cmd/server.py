@@ -1,33 +1,51 @@
+import argparse
+import asyncio
+import logging
+import signal
 
-import argparse, asyncio, json, os, logging
-from socp.core import ws, router, peers, presence, proto, store, public, files, crypto
+from socp.core.config import ServerConfig
+from socp.core.node import ServerRuntime
 
 log = logging.getLogger("socp.server")
 
-async def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    args = ap.parse_args()
 
-    # Load config (very simple YAML-like parsing for stub; replace with real yaml later)
-    import yaml
-    with open(args.config, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+async def _run_server(config_path: str) -> None:
+    cfg = ServerConfig.from_file(config_path)
+    runtime = ServerRuntime(cfg)
+    await runtime.start()
 
-    host, port = cfg["listen"].split(":")
-    port = int(port)
+    stop_event = asyncio.Event()
 
-    await store.init(cfg.get("db_path", "socp.db"))
-    await public.ensure_public_group()
+    loop = asyncio.get_running_loop()
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+    except NotImplementedError:
+        pass
 
-    # Start WS server with a simple on_message callback
-    async def on_message(link, frame_text):
-        # TODO: parse envelope, route, verify, etc.
-        log.info("Received frame: %s", frame_text[:200])
+    log.info("SOCP runtime started. Press Ctrl+C to stop.")
+    await stop_event.wait()
+    await runtime.stop()
 
-    log.info("Starting SOCP server on %s:%d", host, port)
-    await ws.serve(host, port, on_message)
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SOCP v1.3 server")
+    parser.add_argument("--config", required=True, help="Path to server YAML config")
+    parser.add_argument("--once", action="store_true", help="Start and stop immediately (for tests)")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    if args.once:
+        async def _once() -> None:
+            cfg = ServerConfig.from_file(args.config)
+            runtime = ServerRuntime(cfg)
+            await runtime.start()
+            await runtime.stop()
+        asyncio.run(_once())
+    else:
+        asyncio.run(_run_server(args.config))
+
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    asyncio.run(main())
+    main()
