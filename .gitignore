@@ -8,3 +8,4 @@ __pycache__/
 socp.db
 *.log
 .DS_Store
+received/
