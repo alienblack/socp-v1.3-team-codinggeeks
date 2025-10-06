@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass
+from time import time
 from typing import Any, Dict, Mapping, MutableMapping
 
 ERROR_CODES = {"USER_NOT_FOUND", "INVALID_SIG", "BAD_KEY", "TIMEOUT", "UNKNOWN_TYPE", "NAME_IN_USE"}
@@ -60,13 +61,11 @@ class Envelope:
 
 
 def build_frame(type: str, from_: str, to: Any, payload: Mapping[str, Any]) -> Dict[str, Any]:
-    from time import time
-
     return {
         "type": type,
         "from": from_,
         "to": to,
-        "ts": int(time()),
+        "ts": int(time() * 1000),
         "payload": dict(payload),
         "sig": "",
     }

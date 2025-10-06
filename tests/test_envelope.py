@@ -7,5 +7,5 @@ def test_build_frame_has_fields():
 
 def test_build_frame_timestamp_units():
     frame = proto.build_frame("PING", "alice", "bob", {})
-    now = int(time.time())
-    assert abs(frame["ts"] - now) <= 2
+    now_ms = int(time.time() * 1000)
+    assert abs(frame["ts"] - now_ms) <= 200

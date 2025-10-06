@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Awaitable, Callable, Dict, Optional
 
-from . import router
+from . import public, router
 
 log = logging.getLogger("socp.presence")
 
@@ -86,12 +86,21 @@ def handle_remote_join(server_id: str, user_id: str, meta: Optional[Dict[str, An
 
 
 def handle_remote_leave(server_id: str, user_id: str) -> None:
+    if router.USER_LOCATION.get(user_id) != server_id:
+        log.debug(
+            "Ignoring USER_REMOVE for %s from %s; current mapping is %s",
+            user_id,
+            server_id,
+            router.USER_LOCATION.get(user_id),
+        )
+        return
     server_view = _REMOTE_META.get(server_id)
     if server_view and user_id in server_view:
         server_view.pop(user_id, None)
         if not server_view:
             _REMOTE_META.pop(server_id, None)
     router.drop_remote_user(user_id, server_id)
+    public.handle_remote_leave(server_id, user_id)
     log.info("Remote user %s left %s", user_id, server_id)
 
 
@@ -105,9 +114,11 @@ def handle_remote_snapshot(server_id: str, users: Dict[str, Dict[str, Any]]) -> 
     for user in list(router.REMOTE_USERS.get(server_id, set())):
         if user not in existing:
             router.drop_remote_user(user, server_id)
+    public.handle_remote_snapshot(server_id, existing)
 
 
 def handle_remote_disconnect(server_id: str) -> None:
     _REMOTE_META.pop(server_id, None)
     router.drop_remote_server(server_id)
+    public.handle_remote_disconnect(server_id)
     log.warning("Peer %s disconnected; remote users unavailable", server_id)
